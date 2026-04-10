@@ -1,0 +1,27 @@
+{
+  "name": "@brassinai/copilot-cli",
+  "version": "1.0.0",
+  "description": "Standalone local server that exposes GitHub Copilot as a local REST API — like Ollama for Copilot.",
+  "type": "module",
+  "bin": {
+    "copilot-cli": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup src/cli.ts src/server.ts --format esm --target node18 --dts --clean",
+    "dev": "tsx src/cli.ts serve",
+    "start": "node dist/cli.js serve"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "^0.1.30",
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
