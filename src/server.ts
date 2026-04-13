@@ -11,6 +11,13 @@
  *   POST /chat/stream      — Chat completion (SSE streaming)
  *   GET  /run/:runId       — Poll for run result
  *
+ * Tool calling:
+ *   Both /chat/stream and /chat/completions accept a `tools` array and an
+ *   optional `toolCallbackUrl`.  When the model invokes a tool the server
+ *   POSTs { toolName, toolCallId, arguments, sessionId } to that URL and
+ *   expects a JSON response of the form { result: "..." }.
+ *   For streaming, `tool_call` and `tool_result` SSE events are also emitted.
+ *
  * The API is designed to be called directly from the browser — no proxy needed.
  * CORS is wide open (localhost only) since this is a local-only server.
  */
@@ -33,7 +40,108 @@ import {
   listModels,
 } from './sessionManager.js'
 
+// ---------------------------------------------------------------------------
+// Tool calling types
+// ---------------------------------------------------------------------------
+
+/**
+ * A tool definition provided by the API caller.
+ * `parameters` is a standard JSON Schema object describing the tool's input.
+ * When the model invokes the tool, the server POSTs to `callbackUrl` (or the
+ * top-level `toolCallbackUrl`) and returns the response body's `result` field
+ * back to the model.
+ */
+export interface ToolDefinition {
+  name: string
+  description?: string
+  parameters?: Record<string, unknown>
+  /** Per-tool override for the callback URL. Falls back to request-level toolCallbackUrl. */
+  callbackUrl?: string
+}
+
+interface ToolCallEvent {
+  type: 'tool_call'
+  toolName: string
+  toolCallId: string
+  arguments: unknown
+}
+
+interface ToolResultEvent {
+  type: 'tool_result'
+  toolName: string
+  toolCallId: string
+  result: unknown
+}
+
+/**
+ * Build an array of SDK Tool objects from caller-supplied ToolDefinitions.
+ *
+ * @param toolDefs     - Array of tool definitions from the request body.
+ * @param defaultUrl   - Fallback callback URL when a tool has no `callbackUrl`.
+ * @param onEvent      - Optional sink for SSE events (streaming only).
+ */
+function buildTools(
+  toolDefs: ToolDefinition[],
+  defaultUrl: string | undefined,
+  onEvent?: (event: ToolCallEvent | ToolResultEvent) => void,
+): any[] {
+  return toolDefs.map((def) => {
+    const cbUrl = def.callbackUrl ?? defaultUrl
+    return {
+      name: def.name,
+      description: def.description,
+      ...(def.parameters ? { parameters: def.parameters } : {}),
+      handler: async (args: unknown, invocation: { sessionId: string; toolCallId: string; toolName: string }) => {
+        onEvent?.({ type: 'tool_call', toolName: def.name, toolCallId: invocation.toolCallId, arguments: args })
+
+        if (!cbUrl) {
+          const msg = `No callbackUrl configured for tool "${def.name}"`
+          console.warn(`[copilot-cli][tools] ${msg}`)
+          onEvent?.({ type: 'tool_result', toolName: def.name, toolCallId: invocation.toolCallId, result: msg })
+          return { textResultForLlm: msg, resultType: 'failure' }
+        }
+
+        try {
+          const resp = await fetch(cbUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              toolName: def.name,
+              toolCallId: invocation.toolCallId,
+              arguments: args,
+              sessionId: invocation.sessionId,
+            }),
+          })
+
+          if (!resp.ok) {
+            const errBody = await resp.text().catch(() => '')
+            const msg = `Tool callback HTTP ${resp.status}: ${errBody}`
+            onEvent?.({ type: 'tool_result', toolName: def.name, toolCallId: invocation.toolCallId, result: msg })
+            return { textResultForLlm: msg, resultType: 'failure' }
+          }
+
+          const data = await resp.json().catch(() => null)
+          // Accept { result: "..." } or { textResultForLlm: "..." } or bare string
+          const resultText =
+            typeof data === 'string'
+              ? data
+              : (data?.result ?? data?.textResultForLlm ?? JSON.stringify(data))
+          onEvent?.({ type: 'tool_result', toolName: def.name, toolCallId: invocation.toolCallId, result: resultText })
+          return { textResultForLlm: String(resultText), resultType: 'success' }
+        } catch (err: any) {
+          const msg = `Tool callback error: ${err?.message ?? String(err)}`
+          console.error(`[copilot-cli][tools] ${msg}`)
+          onEvent?.({ type: 'tool_result', toolName: def.name, toolCallId: invocation.toolCallId, result: msg })
+          return { textResultForLlm: msg, resultType: 'failure' }
+        }
+      },
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
 // In-memory run store (lightweight version of copilot-server/runStore)
+// ---------------------------------------------------------------------------
 
 interface Run {
   runId: string
@@ -84,7 +192,7 @@ export function createServer() {
 
   // POST /chat/stream — SSE streaming 
   app.post('/chat/stream', async (req, res) => {
-    const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs } = req.body as {
+    const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, tools, toolCallbackUrl } = req.body as {
       model: string
       messages: Array<{ role: string; content: string }>
       system?: string
@@ -93,6 +201,8 @@ export function createServer() {
       responseFormat?: string
       reasoning?: { enabled: boolean; budgetTokens?: number }
       timeoutMs?: number
+      tools?: ToolDefinition[]
+      toolCallbackUrl?: string
     }
 
     res.setHeader('Content-Type', 'text/event-stream')
@@ -132,6 +242,7 @@ export function createServer() {
         ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
         ...(responseFormat === 'json_object' ? { responseFormat: 'json' } : {}),
         ...(reasoning?.enabled ? { reasoning: { budgetTokens: reasoning.budgetTokens ?? 6000 } } : {}),
+        ...(tools?.length ? { tools: buildTools(tools, toolCallbackUrl, (ev) => send(ev)) } : {}),
       })
 
       const waitTimeout = timeoutMs ?? 180_000
@@ -238,7 +349,7 @@ export function createServer() {
 
   // POST /chat/completions — poll-based (returns runId)
   app.post('/chat/completions', async (req, res) => {
-    const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot } = req.body as {
+    const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot, tools, toolCallbackUrl } = req.body as {
       model: string
       messages: Array<{ role: string; content: string }>
       system?: string
@@ -248,6 +359,8 @@ export function createServer() {
       reasoning?: { enabled: boolean; budgetTokens?: number }
       timeoutMs?: number
       screenshot?: string
+      tools?: ToolDefinition[]
+      toolCallbackUrl?: string
     }
 
     const runId = randomUUID()
@@ -256,7 +369,7 @@ export function createServer() {
     res.json({ runId, status: 'queued' })
 
     // Fire-and-forget background execution
-    executeRun(runId, { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot }).catch((err) => {
+    executeRun(runId, { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot, tools, toolCallbackUrl }).catch((err) => {
       const run = runs.get(runId)
       if (run) {
         run.status = 'failed'
@@ -290,9 +403,11 @@ async function executeRun(
     reasoning?: { enabled: boolean; budgetTokens?: number }
     timeoutMs?: number
     screenshot?: string
+    tools?: ToolDefinition[]
+    toolCallbackUrl?: string
   },
 ): Promise<void> {
-  const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot } = params
+  const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot, tools, toolCallbackUrl } = params
 
   // Convert screenshot to temp file for SDK attachments
   let screenshotTmpFile: string | null = null
@@ -355,6 +470,7 @@ async function executeRun(
       ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
       ...(responseFormat === 'json_object' ? { responseFormat: 'json' } : {}),
       ...(reasoning?.enabled ? { reasoning: { budgetTokens: reasoning.budgetTokens ?? 6000 } } : {}),
+      ...(tools?.length ? { tools: buildTools(tools, toolCallbackUrl) } : {}),
     })
 
     const waitTimeout = timeoutMs ?? 300_000
