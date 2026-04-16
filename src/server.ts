@@ -1,32 +1,12 @@
 /**
  * server.ts — Standalone GitHub Copilot REST API server.
- *
  * Exposes GitHub Copilot as a local HTTP API at http://localhost:18966
- * (port chosen to avoid conflicts with common dev servers).
- *
- * Endpoints:
- *   GET  /status          — Health check + auth status
- *   GET  /models          — List available models
- *   POST /chat/completions — Chat completion (non-streaming, poll-based)
- *   POST /chat/stream      — Chat completion (SSE streaming)
- *   GET  /run/:runId       — Poll for run result
- *
- * Tool calling:
- *   Both /chat/stream and /chat/completions accept a `tools` array and an
- *   optional `toolCallbackUrl`.  When the model invokes a tool the server
- *   POSTs { toolName, toolCallId, arguments, sessionId } to that URL and
- *   expects a JSON response of the form { result: "..." }.
- *   For streaming, `tool_call` and `tool_result` SSE events are also emitted.
- *
- * The API is designed to be called directly from the browser — no proxy needed.
- * CORS is wide open (localhost only) since this is a local-only server.
  */
 
 import express from 'express'
 import cors from 'cors'
 import { randomUUID } from 'crypto'
 import {
-  init,
   isReady,
   getInitError,
   getClient,
@@ -40,22 +20,10 @@ import {
   listModels,
 } from './sessionManager.js'
 
-// ---------------------------------------------------------------------------
-// Tool calling types
-// ---------------------------------------------------------------------------
-
-/**
- * A tool definition provided by the API caller.
- * `parameters` is a standard JSON Schema object describing the tool's input.
- * When the model invokes the tool, the server POSTs to `callbackUrl` (or the
- * top-level `toolCallbackUrl`) and returns the response body's `result` field
- * back to the model.
- */
 export interface ToolDefinition {
   name: string
   description?: string
   parameters?: Record<string, unknown>
-  /** Per-tool override for the callback URL. Falls back to request-level toolCallbackUrl. */
   callbackUrl?: string
 }
 
@@ -73,13 +41,94 @@ interface ToolResultEvent {
   result: unknown
 }
 
-/**
- * Build an array of SDK Tool objects from caller-supplied ToolDefinitions.
- *
- * @param toolDefs     - Array of tool definitions from the request body.
- * @param defaultUrl   - Fallback callback URL when a tool has no `callbackUrl`.
- * @param onEvent      - Optional sink for SSE events (streaming only).
- */
+interface OAIToolCall {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
+
+interface OAIMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string | null
+  tool_calls?: OAIToolCall[]
+  tool_call_id?: string
+}
+
+interface OAITool {
+  type: 'function'
+  function: {
+    name: string
+    description?: string
+    parameters?: Record<string, unknown>
+  }
+}
+
+function normalizeToolDefs(tools?: (OAITool | ToolDefinition)[]): ToolDefinition[] {
+  if (!tools?.length) return []
+  return tools.map(t => {
+    if ('type' in t && t.type === 'function' && 'function' in t) {
+      const fn = (t as OAITool).function
+      return { name: fn.name, description: fn.description, parameters: fn.parameters }
+    }
+    return t as ToolDefinition
+  })
+}
+
+function buildFromMessages(messages: OAIMessage[]): { system?: string; prompt: string } {
+  const systemMsgs = messages.filter(m => m.role === 'system')
+  let system = systemMsgs.map(m => m.content ?? '').join('\n') || undefined
+
+  const toolContext: string[] = []
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && msg.tool_calls?.length) {
+      for (const tc of msg.tool_calls) {
+        toolContext.push(`You called tool "${tc.function.name}" with: ${tc.function.arguments}`)
+      }
+    }
+    if (msg.role === 'tool') {
+      toolContext.push(`Tool result (${msg.tool_call_id}): ${msg.content}`)
+    }
+  }
+
+  if (toolContext.length) {
+    const ctx = `\n\n## Tool Results from Previous Turn\n${toolContext.join('\n')}\n\nUse these results to answer the user's question.`
+    system = system ? system + ctx : ctx.trim()
+  }
+
+  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
+  return { system, prompt: lastUserMsg?.content ?? '' }
+}
+
+interface CapturedToolCall {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
+
+function buildCaptureTools(
+  toolDefs: ToolDefinition[],
+  captured: CapturedToolCall[],
+  onCapture: () => void,
+): any[] {
+  return toolDefs.map(def => ({
+    name: def.name,
+    description: def.description,
+    ...(def.parameters ? { parameters: def.parameters } : {}),
+    handler: async (args: unknown, invocation: { toolCallId: string }) => {
+      captured.push({
+        id: invocation.toolCallId,
+        type: 'function',
+        function: {
+          name: def.name,
+          arguments: typeof args === 'string' ? args : JSON.stringify(args),
+        },
+      })
+      onCapture()
+      return new Promise<never>(() => {})
+    },
+  }))
+}
+
 function buildTools(
   toolDefs: ToolDefinition[],
   defaultUrl: string | undefined,
@@ -121,7 +170,6 @@ function buildTools(
           }
 
           const data = await resp.json().catch(() => null)
-          // Accept { result: "..." } or { textResultForLlm: "..." } or bare string
           const resultText =
             typeof data === 'string'
               ? data
@@ -139,10 +187,6 @@ function buildTools(
   })
 }
 
-// ---------------------------------------------------------------------------
-// In-memory run store (lightweight version of copilot-server/runStore)
-// ---------------------------------------------------------------------------
-
 interface Run {
   runId: string
   status: 'queued' | 'running' | 'completed' | 'failed'
@@ -154,7 +198,6 @@ interface Run {
 
 const runs = new Map<string, Run>()
 
-// Prune completed runs older than 10 minutes
 setInterval(() => {
   const cutoff = Date.now() - 600_000
   for (const [id, run] of runs) {
@@ -171,7 +214,6 @@ export function createServer() {
   app.use(cors())
   app.use(express.json({ limit: '10mb' }))
 
-  // GET /status
   app.get('/status', (_req, res) => {
     if (isReady()) {
       res.json({ status: 'ok', authenticated: true })
@@ -180,7 +222,6 @@ export function createServer() {
     }
   })
 
-  // GET /models
   app.get('/models', async (_req, res) => {
     try {
       const models = await listModels()
@@ -190,7 +231,6 @@ export function createServer() {
     }
   })
 
-  // POST /chat/stream — SSE streaming 
   app.post('/chat/stream', async (req, res) => {
     const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, tools, toolCallbackUrl } = req.body as {
       model: string
@@ -347,9 +387,8 @@ export function createServer() {
     }
   })
 
-  // POST /chat/completions — poll-based (returns runId)
   app.post('/chat/completions', async (req, res) => {
-    const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot, tools, toolCallbackUrl } = req.body as {
+    const { model, messages, temperature, responseFormat, reasoning, timeoutMs, screenshot, tools, toolCallbackUrl } = req.body as {
       model: string
       messages: Array<{ role: string; content: string }>
       system?: string
@@ -363,12 +402,15 @@ export function createServer() {
       toolCallbackUrl?: string
     }
 
+    const maxTokens = (req.body.maxTokens ?? req.body.max_tokens) as number | undefined
+    const systemFromBody = req.body.system as string | undefined
+    const systemFromMessages = messages?.find?.((m) => m.role === 'system')?.content
+    const system = systemFromBody ?? systemFromMessages
+
     const runId = randomUUID()
     runs.set(runId, { runId, status: 'queued', createdAt: Date.now(), updatedAt: Date.now() })
 
     res.json({ runId, status: 'queued' })
-
-    // Fire-and-forget background execution
     executeRun(runId, { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot, tools, toolCallbackUrl }).catch((err) => {
       const run = runs.get(runId)
       if (run) {
@@ -379,11 +421,340 @@ export function createServer() {
     })
   })
 
-  // GET /run/:runId — poll for result 
   app.get('/run/:runId', (req, res) => {
     const run = runs.get(req.params.runId)
     if (!run) return res.status(404).json({ error: 'Run not found' })
     res.json(run)
+  })
+
+  app.post('/v1/chat/completions', async (req, res) => {
+    const body = req.body
+    const model: string = body.model
+    const messages: OAIMessage[] = body.messages ?? []
+    const toolDefs = normalizeToolDefs(body.tools)
+    const toolChoice: string | undefined = typeof body.tool_choice === 'string' ? body.tool_choice : undefined
+    const isStream: boolean = body.stream === true
+    const temperature: number | undefined = body.temperature
+    const maxTokens: number | undefined = body.max_tokens
+    const responseFormat: string | undefined = body.response_format?.type
+    const reasoning = body.reasoning as { enabled: boolean; budgetTokens?: number } | undefined
+    const timeoutMs: number | undefined = body.timeoutMs ?? body.timeout_ms
+    const toolCallbackUrl: string | undefined = body.toolCallbackUrl
+
+    const { system, prompt } = buildFromMessages(messages)
+
+    const completionId = `chatcmpl-${randomUUID()}`
+    const created = Math.floor(Date.now() / 1000)
+
+    const skipTools = toolChoice === 'none' || !toolDefs.length
+    const useCallbackMode = !skipTools && !!toolCallbackUrl
+    const useClientSideMode = !skipTools && !toolCallbackUrl
+
+    const makeChoice = (content: string | null, finishReason: string, toolCalls?: CapturedToolCall[]) => ({
+      index: 0,
+      message: {
+        role: 'assistant' as const,
+        content,
+        ...(toolCalls?.length ? { tool_calls: toolCalls } : {}),
+      },
+      finish_reason: finishReason,
+    })
+
+    const makeResponse = (choices: ReturnType<typeof makeChoice>[], usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }) => ({
+      id: completionId,
+      object: 'chat.completion' as const,
+      created,
+      model,
+      choices,
+      usage,
+    })
+
+    const makeChunk = (delta: Record<string, unknown>, finishReason: string | null) => ({
+      id: completionId,
+      object: 'chat.completion.chunk' as const,
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    })
+
+    try {
+      await waitReady(20_000)
+    } catch (err: any) {
+      const errMsg = err?.message ?? 'Copilot client not ready'
+      if (isStream) {
+        res.setHeader('Content-Type', 'text/event-stream')
+        res.setHeader('Cache-Control', 'no-cache')
+        res.setHeader('Connection', 'keep-alive')
+        res.flushHeaders()
+        res.write(`data: ${JSON.stringify({ error: { message: errMsg, type: 'server_error' } })}\n\n`)
+        res.write('data: [DONE]\n\n')
+        res.end()
+      } else {
+        res.status(503).json({ error: { message: errMsg, type: 'server_error' } })
+      }
+      return
+    }
+
+    const captured: CapturedToolCall[] = []
+    let captureResolve: (() => void) | null = null
+    const capturePromise = new Promise<void>(r => { captureResolve = r })
+
+    let sdkTools: any[] | undefined
+    if (useCallbackMode) {
+      sdkTools = buildTools(toolDefs, toolCallbackUrl)
+    } else if (useClientSideMode) {
+      sdkTools = buildCaptureTools(toolDefs, captured, () => captureResolve?.())
+    }
+
+    const release = await acquireSession()
+    let session: any = null
+
+    try {
+      const c = getClient()
+      session = await c.createSession({
+        model,
+        streaming: true,
+        onPermissionRequest: getApproveAllFn(),
+        infiniteSessions: { enabled: false },
+        hooks: {
+          onErrorOccurred: async (input: any) => {
+            console.warn(`[copilot-cli] /v1/chat/completions session error: ${input.error}`)
+            return { errorHandling: 'retry' }
+          },
+        },
+        ...(system ? { systemMessage: { mode: 'replace', content: system } } : {}),
+        ...(temperature != null ? { temperature } : {}),
+        ...(maxTokens != null ? { maxOutputTokens: maxTokens } : {}),
+        ...(responseFormat === 'json_object' ? { responseFormat: 'json' } : {}),
+        ...(reasoning?.enabled ? { reasoning: { budgetTokens: reasoning.budgetTokens ?? 6000 } } : {}),
+        ...(sdkTools?.length ? { tools: sdkTools } : {}),
+      })
+
+      if (isStream) {
+        res.setHeader('Content-Type', 'text/event-stream')
+        res.setHeader('Cache-Control', 'no-cache')
+        res.setHeader('Connection', 'keep-alive')
+        res.flushHeaders()
+
+        const sendChunk = (chunk: object) => res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+
+        sendChunk(makeChunk({ role: 'assistant' }, null))
+
+        await new Promise<void>((resolve) => {
+          let settled = false
+          let gotFirstToken = false
+          let lastDeltaAt = Date.now()
+          const sendStartedAt = Date.now()
+          let activityCheckInterval: ReturnType<typeof setInterval> | null = null
+
+          const settle = (finishReason: string) => {
+            if (settled) return
+            settled = true
+            if (activityCheckInterval) clearInterval(activityCheckInterval)
+            sendChunk(makeChunk({}, finishReason))
+            res.write('data: [DONE]\n\n')
+            resolve()
+          }
+
+          const unsubDelta = session.on('assistant.message_delta', (event: any) => {
+            const delta = event.data?.deltaContent ?? ''
+            if (delta) {
+              if (!gotFirstToken) gotFirstToken = true
+              sendChunk(makeChunk({ content: delta }, null))
+              lastDeltaAt = Date.now()
+            }
+          })
+
+          const unsubIdle = session.on('session.idle', () => {
+            settle('stop')
+          })
+
+          const unsubError = session.on('session.error', (event: any) => {
+            const errType = event.data?.errorType ?? 'unknown'
+            const errMsg = event.data?.message ?? 'Unknown session error'
+            if (settled || errType === 'rate_limit') return
+            settled = true
+            if (activityCheckInterval) clearInterval(activityCheckInterval)
+            sendChunk({ error: { message: `${errType}: ${errMsg}`, type: errType } })
+            res.write('data: [DONE]\n\n')
+            resolve()
+          })
+
+          const unsubReasoning = session.on('assistant.reasoning_delta', () => {
+            lastDeltaAt = Date.now()
+          })
+
+          session.__unsubs = [unsubDelta, unsubIdle, unsubError, unsubReasoning]
+
+          if (useClientSideMode) {
+            capturePromise.then(() => {
+              if (settled) return
+              setTimeout(() => {
+                if (settled) return
+                for (let i = 0; i < captured.length; i++) {
+                  const tc = captured[i]
+                  sendChunk(makeChunk({
+                    tool_calls: [{
+                      index: i,
+                      id: tc.id,
+                      type: 'function',
+                      function: { name: tc.function.name, arguments: tc.function.arguments },
+                    }],
+                  }, null))
+                }
+                settle('tool_calls')
+              }, 150)
+            })
+          }
+
+          const waitTimeout = timeoutMs ?? 180_000
+          const FIRST_TOKEN_TIMEOUT = 120_000
+          const STALL_TIMEOUT = 45_000
+          const hardDeadline = Date.now() + waitTimeout
+
+          activityCheckInterval = setInterval(() => {
+            if (settled) { clearInterval(activityCheckInterval!); return }
+            const now = Date.now()
+            if (!gotFirstToken) {
+              if (now - sendStartedAt >= FIRST_TOKEN_TIMEOUT || now >= hardDeadline) settle('stop')
+              return
+            }
+            if (now - lastDeltaAt >= STALL_TIMEOUT || now >= hardDeadline) settle('stop')
+          }, 5_000)
+
+          session.send({ prompt }).catch((sendErr: any) => {
+            if (settled) return
+            settled = true
+            if (activityCheckInterval) clearInterval(activityCheckInterval)
+            sendChunk({ error: { message: sendErr?.message ?? 'Send failed', type: 'server_error' } })
+            res.write('data: [DONE]\n\n')
+            resolve()
+          })
+        })
+
+        res.end()
+      } else {
+        const waitTimeout = timeoutMs ?? 300_000
+        let fullContent = ''
+
+        const { content, toolCalls, errorMessage } = await new Promise<{
+          content: string
+          toolCalls: CapturedToolCall[]
+          errorMessage?: string
+        }>((resolve) => {
+          let settled = false
+          let gotFirstToken = false
+          let lastDeltaAt = Date.now()
+          const sendStartedAt = Date.now()
+          let activityCheckInterval: ReturnType<typeof setInterval> | null = null
+
+          const unsubDelta = session.on('assistant.message_delta', (event: any) => {
+            const delta = event.data?.deltaContent ?? ''
+            if (!gotFirstToken && delta) gotFirstToken = true
+            fullContent += delta
+            lastDeltaAt = Date.now()
+          })
+
+          const unsubIdle = session.on('session.idle', () => {
+            if (settled) return
+            settled = true
+            if (activityCheckInterval) clearInterval(activityCheckInterval)
+            resolve({ content: fullContent, toolCalls: [] })
+          })
+
+          const unsubMsg = session.on('assistant.message', (event: any) => {
+            const finalContent = event.data?.content
+            if (finalContent && finalContent.length > fullContent.length) fullContent = finalContent
+          })
+
+          const unsubError = session.on('session.error', (event: any) => {
+            const errType = event.data?.errorType ?? 'unknown'
+            const errMsg = event.data?.message ?? 'Unknown session error'
+            if (settled || errType === 'rate_limit') return
+            settled = true
+            if (activityCheckInterval) clearInterval(activityCheckInterval)
+            resolve({ content: fullContent, toolCalls: [], errorMessage: `${errType}: ${errMsg}` })
+          })
+
+          const unsubReasoning = session.on('assistant.reasoning_delta', () => {
+            lastDeltaAt = Date.now()
+          })
+
+          session.__unsubs = [unsubDelta, unsubIdle, unsubMsg, unsubError, unsubReasoning]
+
+          if (useClientSideMode) {
+            capturePromise.then(() => {
+              setTimeout(() => {
+                if (settled) return
+                settled = true
+                if (activityCheckInterval) clearInterval(activityCheckInterval)
+                resolve({ content: fullContent, toolCalls: [...captured] })
+              }, 150)
+            })
+          }
+
+          const FIRST_TOKEN_TIMEOUT = 120_000
+          const STALL_TIMEOUT = 45_000
+          const hardDeadline = Date.now() + waitTimeout
+
+          activityCheckInterval = setInterval(() => {
+            if (settled) { clearInterval(activityCheckInterval!); return }
+            const now = Date.now()
+            if (!gotFirstToken) {
+              if (now - sendStartedAt >= FIRST_TOKEN_TIMEOUT || now >= hardDeadline) {
+                settled = true
+                clearInterval(activityCheckInterval!)
+                resolve({ content: '', toolCalls: [], errorMessage: 'Timeout waiting for response' })
+              }
+              return
+            }
+            if (now - lastDeltaAt >= STALL_TIMEOUT || now >= hardDeadline) {
+              settled = true
+              clearInterval(activityCheckInterval!)
+              resolve({ content: fullContent, toolCalls: [] })
+            }
+          }, 5_000)
+
+          session.send({ prompt }).catch((sendErr: any) => {
+            if (settled) return
+            settled = true
+            if (activityCheckInterval) clearInterval(activityCheckInterval)
+            resolve({ content: fullContent, toolCalls: [], errorMessage: sendErr?.message })
+          })
+        })
+
+        if (errorMessage && content.length === 0) {
+          res.status(500).json({ error: { message: errorMessage, type: 'server_error' } })
+        } else if (toolCalls.length > 0) {
+          res.json(makeResponse([makeChoice(content || null, 'tool_calls', toolCalls)]))
+        } else {
+          res.json(makeResponse([makeChoice(content, 'stop')]))
+        }
+      }
+    } catch (err: any) {
+      if (isSessionStuckError(err) || isAuthError(err)) {
+        drainSessionQueue()
+        reinitClient().catch(() => {})
+      }
+      if (isStream) {
+        try {
+          res.write(`data: ${JSON.stringify({ error: { message: err?.message ?? 'Chat failed', type: 'server_error' } })}\n\n`)
+          res.write('data: [DONE]\n\n')
+          res.end()
+        } catch {}
+      } else {
+        res.status(500).json({ error: { message: err?.message ?? 'Chat failed', type: 'server_error' } })
+      }
+    } finally {
+      try {
+        if (session?.__unsubs) for (const unsub of session.__unsubs) unsub?.()
+      } catch {}
+      try { session?.abort?.() } catch {}
+      try {
+        await Promise.race([session?.disconnect?.() ?? session?.destroy?.(), new Promise((r) => setTimeout(r, 2_000))])
+      } catch {}
+      release()
+    }
   })
 
   return app
@@ -409,7 +780,6 @@ async function executeRun(
 ): Promise<void> {
   const { model, messages, system, temperature, maxTokens, responseFormat, reasoning, timeoutMs, screenshot, tools, toolCallbackUrl } = params
 
-  // Convert screenshot to temp file for SDK attachments
   let screenshotTmpFile: string | null = null
   if (screenshot) {
     try {
@@ -445,7 +815,6 @@ async function executeRun(
   let session: any = null
   let fullContent = ''
 
-  // Heartbeat — keep run's updatedAt alive
   const heartbeatInterval = setInterval(() => {
     run.updatedAt = Date.now()
   }, 10_000)
@@ -549,7 +918,6 @@ async function executeRun(
         }
       }, 5_000)
 
-      // Build send payload
       const promptText = lastUserMsg?.content ?? ''
       const sendPayload: { prompt: string; attachments?: Array<{ type: string; path: string; displayName: string }> } = { prompt: promptText }
       if (screenshotTmpFile) {
@@ -576,7 +944,6 @@ async function executeRun(
         reinitClient().catch(() => {})
       }
     } else if (timedOut && responseContent.length === 0) {
-      // Retry with sendAndWait
       console.warn(`[copilot-cli] run ${runId} retrying with sendAndWait…`)
       try {
         const lastUserMsg2 = [...messages].reverse().find((m) => m.role === 'user')
@@ -628,7 +995,6 @@ async function executeRun(
     try {
       await Promise.race([session?.disconnect?.() ?? session?.destroy?.(), new Promise((r) => setTimeout(r, 2_000))])
     } catch {}
-    // Clean up temp file
     if (screenshotTmpFile) {
       import('fs/promises').then((fs) => fs.unlink(screenshotTmpFile!)).catch(() => {})
     }
